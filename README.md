@@ -120,7 +120,7 @@ nobot = NoBot(app, secret="...")  # uses DEFAULT_RULES
 nobot = NoBot(app, secret="...", rules=DEFAULT_RULES + [Rule(...)])
 ```
 
-`DEFAULT_RULES` covers: Cloudflare-Worker deny, known-bad/vuln/WP scanners, dotfile/shell/traversal probes (deny); well-known, favicon, robots, health, search engines, feed readers, monitoring, link previews, archive.org (allow); AI bots, headless browsers, aggressive scrapers, empty UA (challenge); curl/wget, missing Accept/Accept-Language, Connection:close (weigh).
+`DEFAULT_RULES` covers: Cloudflare-Worker deny, known-bad/vuln/WP scanners, dotfile/shell/traversal probes (deny); well-known, favicon, robots, sitemap, health, search engines, feed readers, monitoring, link previews, archive.org (allow); AI bots, headless browsers, aggressive scrapers, empty UA (challenge); curl/wget, missing Accept/Accept-Language, Connection:close (weigh).
 
 ### Rule fields
 
