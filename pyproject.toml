@@ -1,6 +1,6 @@
 [project]
 name = "flask-nobot"
-version = "1.0.0"
+version = "1.0.1"
 description = "Lightweight, zero-dependency bot protection for Flask applications."
 readme = "README.md"
 authors = [

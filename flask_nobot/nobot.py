@@ -7,19 +7,28 @@ import ipaddress
 import json
 import re
 import secrets
+import threading
 import time
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Iterable
+from typing import Any, Protocol
 from urllib.parse import urlparse
 
 from flask import Flask, Response, current_app, jsonify, make_response, request
+from werkzeug.datastructures import Headers
 
 COOKIE_TOKEN = "_nobot"
 COOKIE_NONCE = "_nobot_n"
 VERIFY_PATH = "/_nobot/verify"
+
 ACTIONS = {"allow", "deny", "challenge", "weigh"}
-HEADLESS_UA = ("HeadlessChrome", "PhantomJS", "Electron")
+
+HEADLESS_UA = (
+    "headlesschrome",
+    "phantomjs",
+    "electron",
+)
 
 _BOT_SIGNAL = re.compile(
     r"bot\b|crawl|spider|scrape|fetch(?![\w]*api)"
@@ -38,17 +47,21 @@ _KNOWN_TOOL = re.compile(
     re.I,
 )
 
-_URL_IN_UA = re.compile(r"(?:^|[+;]|\s-\s)https?://[^\s);,]+", re.I)
+_URL_IN_UA = re.compile(
+    r"(?:^|[+;]|\s-\s)https?://[^\s);,]+",
+    re.I,
+)
 
 _BROWSER = re.compile(
-    r"mozilla/|webkit|gecko|trident|presto|khtml"
-    r"|opera[\s/]|links\s|lynx/|\((?:windows|macintosh|x11|linux)",
+    r"mozilla/|webkit|gecko|trident|presto"
+    r"|khtml|opera[\s/]|links\s|lynx/"
+    r"|\((?:windows|macintosh|x11|linux)",
     re.I,
 )
 
 _BOGONS = [
-    ipaddress.ip_network(n)
-    for n in (
+    ipaddress.ip_network(network)
+    for network in (
         "0.0.0.0/8",
         "10.0.0.0/8",
         "100.64.0.0/10",
@@ -71,11 +84,23 @@ _BOGONS = [
 ]
 
 
+class PolicyCallable(Protocol):
+    _nobot_policy: str
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any: ...
+
+
+ResponseValue = Response | tuple[Response, int]
+
+
 def is_crawler(user_agent: str) -> bool:
     if not user_agent:
         return True
 
-    if _BOT_SIGNAL.search(user_agent) or _KNOWN_TOOL.search(user_agent):
+    if _BOT_SIGNAL.search(user_agent):
+        return True
+
+    if _KNOWN_TOOL.search(user_agent):
         return True
 
     if _URL_IN_UA.search(user_agent):
@@ -84,21 +109,23 @@ def is_crawler(user_agent: str) -> bool:
     return not _BROWSER.search(user_agent)
 
 
-def is_bogon(ip: str) -> bool:
+def is_bogon(ip_address_value: str) -> bool:
     try:
-        addr = ipaddress.ip_address(ip)
+        address = ipaddress.ip_address(ip_address_value)
     except ValueError:
         return True
 
-    return any(addr in n for n in _BOGONS)
+    return any(address in network for network in _BOGONS)
 
 
-def _mark(policy: str) -> Callable:
-    def deco(fn):
-        fn._nobot_policy = policy
-        return fn
+def _mark(
+    policy: str,
+) -> Callable[[PolicyCallable], PolicyCallable]:
+    def decorator(function: PolicyCallable) -> PolicyCallable:
+        function._nobot_policy = policy
+        return function
 
-    return deco
+    return decorator
 
 
 skip = _mark("skip")
@@ -119,61 +146,123 @@ class Rule:
     remote_addresses: list[str] = field(default_factory=list)
     weight: int = 0
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         self.action = self.action.lower()
+
         if self.action not in ACTIONS:
             raise ValueError(f"invalid action: {self.action}")
 
-        self._path = re.compile(self.path) if self.path else None
-        self._method = re.compile(self.method, re.I) if self.method else None
-        self._ua = re.compile(self.user_agent, re.I) if self.user_agent else None
+        self._path = self._compile(self.path)
+        self._method = self._compile(self.method, re.I)
+        self._user_agent = self._compile(self.user_agent, re.I)
 
         self._headers = {
-            k.lower(): re.compile(v, re.I) for k, v in self.headers.items()
+            name: re.compile(pattern, re.I) for name, pattern in self.headers.items()
         }
-        self._missing = [h.lower() for h in self.missing_headers]
-        self._nets = [
-            ipaddress.ip_network(c, strict=False) for c in self.remote_addresses
+
+        self._missing = set(self.missing_headers)
+
+        self._networks = [
+            ipaddress.ip_network(network, strict=False)
+            for network in self.remote_addresses
         ]
 
-    def matches(self, path, method, ua, headers, ip) -> bool:
+    @staticmethod
+    def _compile(
+        pattern: str | None,
+        flags: int = 0,
+    ) -> re.Pattern[str] | None:
+        if not pattern:
+            return None
+
+        try:
+            return re.compile(pattern, flags)
+        except re.error as error:
+            raise ValueError(f"invalid regex: {pattern}") from error
+
+    def matches(
+        self,
+        path: str,
+        method: str,
+        user_agent: str,
+        headers: Headers,
+        ip_address_value: str,
+    ) -> bool:
         if self._path and not self._path.search(path):
             return False
+
         if self._method and not self._method.fullmatch(method):
             return False
-        if self._ua and not self._ua.search(ua):
+
+        if self._user_agent and not self._user_agent.search(
+            user_agent,
+        ):
             return False
 
-        for name, pat in self._headers.items():
+        for name, pattern in self._headers.items():
             value = headers.get(name)
-            if value is None or not pat.search(value):
+
+            if value is None:
+                return False
+
+            if not pattern.search(value):
                 return False
 
         for name in self._missing:
             if headers.get(name):
                 return False
 
-        if not self._nets:
+        if not self._networks:
             return True
 
         try:
-            addr = ipaddress.ip_address(ip)
+            address = ipaddress.ip_address(ip_address_value)
         except ValueError:
             return False
 
-        return any(addr in n for n in self._nets)
+        return any(address in network for network in self._networks)
 
 
-def _b64e(data: bytes) -> str:
-    return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
+class ReplayStore:
+    def __init__(self, ttl: int):
+        self.ttl = ttl
+        self.values: dict[str, float] = {}
+        self.lock = threading.Lock()
+
+    def consume(self, value: str) -> bool:
+        now = time.monotonic()
+
+        with self.lock:
+            self._cleanup(now)
+
+            if value in self.values:
+                return False
+
+            self.values[value] = now + self.ttl
+            return True
+
+    def _cleanup(self, now: float) -> None:
+        expired = [
+            value for value, expires_at in self.values.items() if expires_at <= now
+        ]
+
+        for value in expired:
+            self.values.pop(value, None)
 
 
-def _b64d(data: str) -> bytes:
-    return base64.urlsafe_b64decode(data + "=" * (-len(data) % 4))
+def _base64_encode(data: bytes) -> str:
+    encoded = base64.urlsafe_b64encode(data)
+    return encoded.rstrip(b"=").decode()
+
+
+def _base64_decode(data: str) -> bytes:
+    padding = "=" * (-len(data) % 4)
+    return base64.urlsafe_b64decode(data + padding)
 
 
 def _hash(value: str) -> str:
-    return hashlib.sha256(value.encode()).hexdigest()[:16]
+    digest = hashlib.sha256(value.encode()).hexdigest()
+    return digest[:16]
 
 
 class NoBot:
@@ -197,8 +286,8 @@ class NoBot:
             from .presets import DEFAULT_RULES
 
             rules = DEFAULT_RULES
-        self.rules = list(rules)
 
+        self.rules = list(rules)
         self.threshold = threshold
         self.token_ttl = token_ttl
         self.nonce_ttl = nonce_ttl
@@ -210,36 +299,85 @@ class NoBot:
 
         self._html = ""
         self._key = b""
-        self._used: dict[str, float] = {}
+        self._replay_store = ReplayStore(nonce_ttl)
 
         if app is not None:
             self.init_app(app)
 
     def init_app(self, app: Flask) -> None:
-        cfg, p = app.config, self.prefix
+        cfg, prefix = app.config, self.prefix
 
-        secret = cfg.get(f"{p}SECRET", self.secret) or cfg.get("SECRET_KEY")
+        secret = cfg.get(f"{prefix}SECRET", self.secret)
+        secret = secret or cfg.get("SECRET_KEY")
+
         if not secret:
             raise RuntimeError(
-                "NoBot needs a secret (arg, NOBOT_SECRET, or SECRET_KEY)"
+                "NoBot needs a secret " "(arg, NOBOT_SECRET, or SECRET_KEY)"
             )
 
         self.secret = secret
         self._key = secret.encode() if isinstance(secret, str) else secret
 
-        self.threshold = int(cfg.get(f"{p}THRESHOLD", self.threshold))
-        self.token_ttl = int(cfg.get(f"{p}TOKEN_TTL", self.token_ttl))
-        self.nonce_ttl = int(cfg.get(f"{p}NONCE_TTL", self.nonce_ttl))
-        self.mode = cfg.get(f"{p}MODE", self.mode)
-        self.trust_proxy = bool(cfg.get(f"{p}TRUST_PROXY", self.trust_proxy))
-        self.deny_bogons = bool(cfg.get(f"{p}DENY_BOGONS", self.deny_bogons))
-        self.crawler_weight = int(cfg.get(f"{p}CRAWLER_WEIGHT", self.crawler_weight))
-        self.rules += list(cfg.get(f"{p}RULES", []))
+        self.threshold = int(
+            cfg.get(
+                f"{prefix}THRESHOLD",
+                self.threshold,
+            )
+        )
+
+        self.token_ttl = int(
+            cfg.get(
+                f"{prefix}TOKEN_TTL",
+                self.token_ttl,
+            )
+        )
+
+        self.nonce_ttl = int(
+            cfg.get(
+                f"{prefix}NONCE_TTL",
+                self.nonce_ttl,
+            )
+        )
+
+        self.mode = cfg.get(f"{prefix}MODE", self.mode)
+
+        self.trust_proxy = bool(
+            cfg.get(
+                f"{prefix}TRUST_PROXY",
+                self.trust_proxy,
+            )
+        )
+
+        self.deny_bogons = bool(
+            cfg.get(
+                f"{prefix}DENY_BOGONS",
+                self.deny_bogons,
+            )
+        )
+
+        self.crawler_weight = int(
+            cfg.get(
+                f"{prefix}CRAWLER_WEIGHT",
+                self.crawler_weight,
+            )
+        )
+
+        self.rules.extend(cfg.get(f"{prefix}RULES", []))
 
         template = (Path(__file__).parent / "challenge.html").read_text()
-        self._html = template.replace("__URL__", json.dumps(VERIFY_PATH))
 
-        app.add_url_rule(VERIFY_PATH, "_nobot_verify", self._verify, methods=["POST"])
+        self._html = template.replace(
+            "__URL__",
+            json.dumps(VERIFY_PATH),
+        )
+
+        app.add_url_rule(
+            VERIFY_PATH,
+            "_nobot_verify",
+            self._verify,
+            methods=["POST"],
+        )
+
         app.before_request(self._before_request)
         app.extensions.setdefault("nobot", self)
 
@@ -247,124 +385,205 @@ class NoBot:
         self.rules.append(rule)
 
     def _pack(self, data: dict) -> str:
-        payload = json.dumps(data, separators=(",", ":"), sort_keys=True).encode()
-        sig = hmac.new(self._key, payload, hashlib.sha256).digest()
-        return f"{_b64e(payload)}.{_b64e(sig)}"
+        payload = json.dumps(
+            data,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode()
+
+        signature = hmac.new(
+            self._key,
+            payload,
+            hashlib.sha256,
+        ).digest()
+
+        return f"{_base64_encode(payload)}." f"{_base64_encode(signature)}"
 
     def _unpack(self, token: str) -> dict | None:
         if not token or "." not in token:
             return None
 
         try:
-            p_b64, s_b64 = token.split(".", 1)
-            payload, sig = _b64d(p_b64), _b64d(s_b64)
-        except Exception:
+            payload_encoded, signature_encoded = token.split(".", 1)
+            payload = _base64_decode(payload_encoded)
+            signature = _base64_decode(signature_encoded)
+        except ValueError:
             return None
 
-        expected = hmac.new(self._key, payload, hashlib.sha256).digest()
-        if not hmac.compare_digest(sig, expected):
+        expected_signature = hmac.new(
+            self._key,
+            payload,
+            hashlib.sha256,
+        ).digest()
+
+        if not hmac.compare_digest(
+            signature,
+            expected_signature,
+        ):
             return None
 
         try:
             return json.loads(payload)
-        except Exception:
+        except json.JSONDecodeError:
             return None
 
     def _ctx(self) -> tuple[str, str]:
         if self.trust_proxy:
-            fwd = request.headers.get("X-Forwarded-For", "")
-            ip = fwd.split(",")[0].strip() if fwd else request.remote_addr
-        else:
-            ip = request.remote_addr
+            forwarded_for = request.headers.get(
+                "X-Forwarded-For",
+                "",
+            )
 
-        return ip or "0.0.0.0", request.headers.get("User-Agent", "")
+            if forwarded_for:
+                ip_address_value = forwarded_for.split(
+                    ",",
+                    1,
+                )[0].strip()
+            else:
+                ip_address_value = request.remote_addr
+        else:
+            ip_address_value = request.remote_addr
+
+        user_agent = request.headers.get(
+            "User-Agent",
+            "",
+        )
+
+        return ip_address_value or "0.0.0.0", user_agent
 
     def _policy(self) -> str | None:
-        view = current_app.view_functions.get(request.endpoint or "")
+        view = current_app.view_functions.get(
+            request.endpoint or "",
+        )
+
         return getattr(view, "_nobot_policy", None)
 
-    def _bound(self, data: dict, ip: str, ua: str, ttl: int) -> bool:
-        if time.time() - data.get("t", 0) > ttl:
+    def _bound(
+        self,
+        data: dict,
+        ip_address_value: str,
+        user_agent: str,
+        ttl: int,
+    ) -> bool:
+        issued_at = data.get("t", 0)
+
+        if time.time() - issued_at > ttl:
             return False
 
-        return data.get("i") == _hash(ip) and data.get("u") == _hash(ua)
+        return data.get("i") == _hash(ip_address_value) and data.get("u") == _hash(
+            user_agent
+        )
 
-    def _consume(self, nonce_id: str, now: float) -> bool:
-        used = self._used
-
-        for k in [k for k, e in used.items() if e <= now]:
-            used.pop(k, None)
-
-        if nonce_id in used:
-            return False
-
-        used[nonce_id] = now + self.nonce_ttl
-        return True
-
-    def _before_request(self):
+    def _before_request(self) -> ResponseValue | None:
         if request.path == VERIFY_PATH:
             return None
 
         policy = self._policy()
+
         if policy == "skip":
             return None
+
         if self.mode == "off" and policy != "protect":
             return None
 
-        ip, ua = self._ctx()
-        if self.deny_bogons and is_bogon(ip):
+        ip_address_value, user_agent = self._ctx()
+
+        if self.deny_bogons and is_bogon(ip_address_value):
             return self._forbidden("Bogon source.")
 
-        token = self._unpack(request.cookies.get(COOKIE_TOKEN, ""))
-        if (
-            token
-            and self._bound(token, ip, ua, self.token_ttl)
-            and policy != "challenge"
-        ):
-            return None
+        token = self._unpack(
+            request.cookies.get(COOKIE_TOKEN, ""),
+        )
 
-        decision = self._evaluate(ip, ua, policy)
+        if token:
+            valid_token = self._bound(
+                token,
+                ip_address_value,
+                user_agent,
+                self.token_ttl,
+            )
+
+            if valid_token and policy != "challenge":
+                return None
+
+        decision = self._evaluate(
+            ip_address_value,
+            user_agent,
+            policy,
+        )
+
         if decision == "allow":
             return None
+
         if decision == "deny":
             return self._forbidden("Request denied.")
 
-        return self._issue_challenge(ip, ua)
+        return self._issue_challenge(
+            ip_address_value,
+            user_agent,
+        )
 
-    def _evaluate(self, ip: str, ua: str, policy: str | None) -> str:
-        if policy == "challenge" or policy == "block":
+    def _evaluate(
+        self,
+        ip_address_value: str,
+        user_agent: str,
+        policy: str | None,
+    ) -> str:
+        if policy == "block":
+            return "deny"
+
+        if policy == "challenge":
             return "challenge"
 
-        headers = {k.lower(): v for k, v in request.headers.items()}
-        score = self.crawler_weight if is_crawler(ua) else 0
+        score = self.crawler_weight if is_crawler(user_agent) else 0
 
         for rule in self.rules:
-            if not rule.matches(request.path, request.method, ua, headers, ip):
+            matches = rule.matches(
+                request.path,
+                request.method,
+                user_agent,
+                request.headers,
+                ip_address_value,
+            )
+
+            if not matches:
                 continue
+
             if rule.action != "weigh":
                 return rule.action
+
             score += rule.weight
 
-        if score >= self.threshold or self.mode == "all":
+        if score >= self.threshold:
+            return "challenge"
+
+        if self.mode == "all":
             return "challenge"
 
         return "allow"
 
-    def _issue_challenge(self, ip: str, ua: str) -> Response:
+    def _issue_challenge(
+        self,
+        ip_address_value: str,
+        user_agent: str,
+    ) -> Response:
         nonce = self._pack(
             {
                 "t": int(time.time()),
-                "i": _hash(ip),
-                "u": _hash(ua),
-                "p": request.full_path if request.query_string else request.path,
+                "i": _hash(ip_address_value),
+                "u": _hash(user_agent),
+                "p": (request.full_path if request.query_string else request.path),
                 "r": secrets.token_urlsafe(12),
             }
         )
 
-        resp = make_response(self._html, 403)
-        resp.headers["Content-Type"] = "text/html; charset=utf-8"
-        resp.headers["Cache-Control"] = "no-store, private"
-        resp.set_cookie(
+        response = make_response(self._html, 403)
+
+        response.headers["Content-Type"] = "text/html; charset=utf-8"
+
+        response.headers["Cache-Control"] = "no-store, private"
+
+        response.set_cookie(
             COOKIE_NONCE,
             nonce,
             max_age=self.nonce_ttl,
@@ -373,49 +592,76 @@ class NoBot:
             samesite="Strict",
             path="/",
         )
-        return resp
 
-    def _forbidden(self, msg: str) -> Response:
-        resp = make_response(msg, 403)
-        resp.headers["Content-Type"] = "text/plain; charset=utf-8"
-        return resp
+        return response
 
-    def _verify(self):
+    @staticmethod
+    def _forbidden(message: str) -> Response:
+        response = make_response(message, 403)
+
+        response.headers["Content-Type"] = "text/plain; charset=utf-8"
+
+        return response
+
+    def _verify(self) -> ResponseValue:
         origin = request.headers.get("Origin", "")
-        if not origin or urlparse(origin).netloc != request.host:
+
+        if not origin:
             return jsonify(ok=False, msg="bad origin"), 400
+
+        if urlparse(origin).netloc != request.host:
+            return jsonify(ok=False, msg="bad origin"), 400
+
         if request.headers.get("X-Requested-With") != "nobot":
             return jsonify(ok=False, msg="bad request"), 400
 
-        nonce = self._unpack(request.cookies.get(COOKIE_NONCE, ""))
+        nonce = self._unpack(
+            request.cookies.get(COOKIE_NONCE, ""),
+        )
+
         if not nonce:
             return jsonify(ok=False, msg="missing nonce"), 400
 
-        ip, ua = self._ctx()
-        now = time.time()
+        ip_address_value, user_agent = self._ctx()
 
-        if not self._bound(nonce, ip, ua, self.nonce_ttl):
+        if not self._bound(
+            nonce,
+            ip_address_value,
+            user_agent,
+            self.nonce_ttl,
+        ):
             return jsonify(ok=False, msg="invalid nonce"), 400
 
         nonce_id = nonce.get("r", "")
-        if not nonce_id or not self._consume(nonce_id, now):
+
+        if not nonce_id:
+            return jsonify(ok=False, msg="replay"), 400
+
+        if not self._replay_store.consume(nonce_id):
             return jsonify(ok=False, msg="replay"), 400
 
         signals = request.get_json(silent=True) or {}
-        if not self._inspect(signals, ua):
+
+        if not self._inspect(signals, user_agent):
             return jsonify(ok=False, msg="challenge failed"), 403
 
         token = self._pack(
             {
-                "t": int(now),
-                "i": _hash(ip),
-                "u": _hash(ua),
+                "t": int(time.time()),
+                "i": _hash(ip_address_value),
+                "u": _hash(user_agent),
                 "r": secrets.token_urlsafe(8),
             }
         )
 
-        resp = make_response(jsonify(ok=True, next=nonce.get("p") or "/"))
-        resp.set_cookie(
+        response = make_response(
+            jsonify(
+                ok=True,
+                next=nonce.get("p") or "/",
+            )
+        )
+
+        response.set_cookie(
             COOKIE_TOKEN,
             token,
             max_age=self.token_ttl,
@@ -424,7 +670,8 @@ class NoBot:
             samesite="Lax",
             path="/",
         )
-        resp.set_cookie(
+
+        response.set_cookie(
             COOKIE_NONCE,
             "",
             expires=0,
@@ -434,35 +681,65 @@ class NoBot:
             samesite="Strict",
             path="/",
         )
-        return resp
 
-    def _inspect(self, s: dict, ua: str) -> bool:
-        lower = ua.lower()
+        return response
 
-        if any(x in ua for x in HEADLESS_UA) or is_crawler(ua):
+    def _inspect(
+        self,
+        signals: dict,
+        user_agent: str,
+    ) -> bool:
+        lower_user_agent = user_agent.lower()
+
+        if any(value in lower_user_agent for value in HEADLESS_UA):
             return False
 
-        if s.get("webdriver") or s.get("automation"):
+        if is_crawler(user_agent):
             return False
 
-        if not s.get("native", True) or not s.get("cookies"):
+        if signals.get("webdriver"):
             return False
 
-        if s.get("languages", 0) < 1 or s.get("permissionsBug"):
+        if signals.get("automation"):
             return False
 
-        elapsed = s.get("elapsed", 0)
+        if not signals.get("native", True):
+            return False
+
+        if not signals.get("cookies"):
+            return False
+
+        if signals.get("languages", 0) < 1:
+            return False
+
+        if signals.get("permissionsBug"):
+            return False
+
+        elapsed = signals.get("elapsed", 0)
+
         if elapsed < 80 or elapsed > 60_000:
             return False
 
-        renderer = (s.get("renderer") or "").lower()
-        if "swiftshader" in renderer or "llvmpipe" in renderer:
+        renderer = (signals.get("renderer") or "").lower()
+
+        if "swiftshader" in renderer:
             return False
 
-        chrome_ua = "chrome" in lower and "firefox" not in lower
-        if chrome_ua and not s.get("chrome"):
+        if "llvmpipe" in renderer:
             return False
-        if chrome_ua and not s.get("mobile") and s.get("plugins", 0) == 0:
+
+        chrome_user_agent = (
+            "chrome" in lower_user_agent and "firefox" not in lower_user_agent
+        )
+
+        if chrome_user_agent and not signals.get("chrome"):
+            return False
+
+        if (
+            chrome_user_agent
+            and not signals.get("mobile")
+            and signals.get("plugins", 0) == 0
+        ):
             return False
 
         return True
